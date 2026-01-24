@@ -1,0 +1,6 @@
+PyQt6
+Pillow
+PyMuPDF
+numpy
+pytesseract
+opencv-python

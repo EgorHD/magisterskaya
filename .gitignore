@@ -1,0 +1,17 @@
+# PyCharm
+.idea/
+
+# venv
+venv/
+.venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Tests/linters
+.pytest_cache/
+.mypy_cache/
+
+# Env files
+.env
