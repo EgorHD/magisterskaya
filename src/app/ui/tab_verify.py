@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 
 from PyQt6.QtCore import QThread
@@ -17,8 +18,10 @@ from core.models.ocr import OCRResult
 
 from core.watermark.hybrid import HybridConfig
 from core.integrity.restorer import restore_text_from_watermark
-
 from core.integrity.diff import diff_words, format_diffs
+
+# ✅ метрики текста (мягко, отдельно)
+from core.metrics.text_metrics import compute_text_similarity
 
 
 OPEN_FILTER = "Документы (*.pdf *.tif *.tiff *.jpg *.jpeg *.png);;Все файлы (*.*)"
@@ -43,7 +46,6 @@ class VerifyTab(QWidget):
         layout = QVBoxLayout(self)
 
         self.file_panel = FileInfoPanel("Проверяемый файл (защищённый ЭОД)")
-        # унифицируем панель: primary=проверка, secondary=восстановление, save=сохранить отчёт
         self.actions = ActionsBar()
         self.actions.set_primary_text("Проверить целостность")
         self.actions.set_secondary_text("Восстановить (показать текст)")
@@ -52,7 +54,7 @@ class VerifyTab(QWidget):
         self.wm_status = QLabel("ЦВЗ: —")
 
         self.ocr_panel = TextPanel("Распознанный текст (OCR)")
-        self.report_panel = TextPanel("Отчёт об отличиях (локализация подмены)")
+        self.report_panel = TextPanel("Отчёт (включая метрики)")
         self.restored_panel = TextPanel("Восстановленный текст (опционально)")
 
         layout.addWidget(self.file_panel)
@@ -63,7 +65,6 @@ class VerifyTab(QWidget):
         layout.addWidget(self.report_panel, stretch=1)
         layout.addWidget(self.restored_panel, stretch=1)
 
-        # кнопки
         self.actions.btn_action_primary.setEnabled(False)
         self.actions.btn_action_secondary.setEnabled(False)
         self.actions.btn_save.setEnabled(False)
@@ -82,7 +83,6 @@ class VerifyTab(QWidget):
         self._current_path = path
         self._document = None
 
-        # reset state
         self._ocr_full_text = ""
         self._report_ready = False
         self._report_text = ""
@@ -144,7 +144,7 @@ class VerifyTab(QWidget):
             self._ocr_full_text = "\n".join((p.ocr_text or "") for p in self._document.pages)
 
         self.actions.btn_action_primary.setEnabled(True)
-        self.actions.btn_action_secondary.setEnabled(True)  # восстановление можно запускать после OCR
+        self.actions.btn_action_secondary.setEnabled(True)
         self._set_busy(False)
 
     def _on_ocr_failed(self, message: str) -> None:
@@ -164,7 +164,9 @@ class VerifyTab(QWidget):
 
         cfg = HybridConfig()
 
-        # 1) Эталонный текст из резервного слоя (redunant)
+        t0 = time.perf_counter()
+
+        # 1) Эталонный текст из резервного слоя
         res = restore_text_from_watermark(self._document, cfg)
         if isinstance(res, tuple):
             ref_text, dbg = res
@@ -172,8 +174,14 @@ class VerifyTab(QWidget):
             ref_text, dbg = res, ""
 
         if not ref_text:
+            verify_time = time.perf_counter() - t0
             self._report_ready = True
-            self._report_text = "Не удалось извлечь резервный текст из ЦВЗ.\n" + (dbg or "")
+            self._report_text = (
+                "Итог: ЦВЗ НЕ читается.\n\n"
+                "Не удалось извлечь резервный текст из ЦВЗ.\n"
+                + (dbg or "")
+                + f"\n\nВремя проверки: {verify_time:.3f} сек."
+            )
             self.report_panel.set_text(self._report_text)
             self.wm_status.setText("ЦВЗ: НЕ читается")
             self.actions.btn_save.setEnabled(True)
@@ -184,10 +192,29 @@ class VerifyTab(QWidget):
 
         # 2) Diff OCR vs эталон
         diffs = diff_words(self._ocr_full_text, ref_text, max_items=80)
-        self._report_text = format_diffs(diffs)
+        diff_text = format_diffs(diffs)
+
+        # 3) Метрики по тексту (CER/WER)
+        sim = compute_text_similarity(self._ocr_full_text, ref_text)
+
+        verify_time = time.perf_counter() - t0
+
+        metrics_block = (
+            "Метрики (OCR vs эталон из ЦВЗ):\n"
+            f"- CER: {sim.cer:.4f}  (dist={sim.char_distance}, ref_chars={sim.ref_chars})\n"
+            f"- WER: {sim.wer:.4f}  (dist={sim.word_distance}, ref_words={sim.ref_words})\n"
+            f"- Отличий (по diff): {len(diffs)}\n"
+            f"- Время проверки: {verify_time:.3f} сек.\n"
+        )
+
+        if not diffs:
+            summary = "Итог: ПОДМЕН/ИЗМЕНЕНИЙ НЕ ОБНАРУЖЕНО.\n"
+        else:
+            summary = "Итог: ОБНАРУЖЕНО нарушение целостности.\n"
+
+        self._report_text = summary + "\n" + metrics_block + "\n" + diff_text
         self._report_ready = True
         self.report_panel.set_text(self._report_text)
-
         self.actions.btn_save.setEnabled(True)
 
         if not diffs:
@@ -201,10 +228,6 @@ class VerifyTab(QWidget):
             )
 
     def on_restore_clicked(self) -> None:
-        """
-        Опционально: показать полный восстановленный текст (для пользователя).
-        Это НЕ влияет на сохранение отчёта.
-        """
         if not self._document:
             return
 

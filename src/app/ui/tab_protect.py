@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 
 from PyQt6.QtCore import QThread
@@ -21,6 +22,9 @@ from core.models.ocr import OCRResult
 
 from core.watermark.hybrid import HybridConfig, embed_document, extract_from_page
 
+# ✅ метрики (мягко, отдельно)
+from core.metrics.image_quality import compare_images
+
 
 OPEN_FILTER = "Документы (*.pdf *.tif *.tiff *.jpg *.jpeg *.png);;Все файлы (*.*)"
 SAVE_FILTER_LOSSLESS = "TIFF (*.tif *.tiff);;PNG (*.png);;JPEG (*.jpg *.jpeg)"
@@ -33,6 +37,9 @@ class ProtectTab(QWidget):
         self._current_path: str | None = None
         self._document: Document | None = None
         self._is_watermarked: bool = False
+
+        # ✅ копии страниц ДО встраивания (для метрик незаметности)
+        self._orig_images: list = []
 
         self._ocr_thread: QThread | None = None
         self._ocr_worker: OCRWorker | None = None
@@ -77,6 +84,7 @@ class ProtectTab(QWidget):
         self._current_path = path
         self._is_watermarked = False
         self._document = None
+        self._orig_images = []
         self.page_selector.clear()
         self.page_selector.setEnabled(False)
 
@@ -89,6 +97,18 @@ class ProtectTab(QWidget):
             return
 
         self.file_panel.set_path(path)
+
+        # ✅ копируем оригиналы страниц для метрик
+        try:
+            self._orig_images = []
+            for p in self._document.pages:
+                if p.image is not None:
+                    self._orig_images.append(p.image.copy())
+                else:
+                    self._orig_images.append(None)
+        except Exception:
+            # если копирование почему-то не удалось — метрики просто не посчитаем
+            self._orig_images = []
 
         if self._document.pages and self._document.pages[0].image is not None:
             self.preview.set_page(self._document.pages[0].image, None)
@@ -179,8 +199,10 @@ class ProtectTab(QWidget):
 
         cfg = HybridConfig()
 
+        t0 = time.perf_counter()
         try:
             embed_document(self._document, cfg)
+            embed_time = time.perf_counter() - t0
             self._is_watermarked = True
 
             # самопроверка (в памяти)
@@ -190,11 +212,39 @@ class ProtectTab(QWidget):
                 self.actions.btn_save.setEnabled(False)
                 return
 
-            QMessageBox.information(
-                self, "ЦВЗ",
+            # ✅ метрики незаметности (если есть оригиналы)
+            qual_list = []
+            if self._orig_images and len(self._orig_images) == len(self._document.pages):
+                for i, p in enumerate(self._document.pages):
+                    if p.image is None:
+                        continue
+                    orig = self._orig_images[i] if i < len(self._orig_images) else None
+                    if orig is None:
+                        continue
+                    try:
+                        qual_list.append(compare_images(orig, p.image))
+                    except Exception:
+                        pass
+
+            msg = (
                 "ЦВЗ встроен и успешно извлечён сразу после встраивания.\n"
-                "Важно: для LSB-слоя сохраняйте результат в PNG/TIFF (lossless)."
+                "Важно: для LSB-слоя сохраняйте результат в PNG/TIFF (lossless).\n\n"
             )
+
+            if qual_list:
+                mse = sum(q.mse for q in qual_list) / len(qual_list)
+                psnr = sum(q.psnr for q in qual_list) / len(qual_list)
+                ssim = sum(q.ssim for q in qual_list) / len(qual_list)
+                msg += (
+                    "Незаметность (среднее по страницам):\n"
+                    f"MSE: {mse:.6f}\n"
+                    f"PSNR: {psnr:.3f}\n"
+                    f"SSIM: {ssim:.6f}\n\n"
+                )
+
+            msg += f"Время встраивания: {embed_time:.3f} сек."
+
+            QMessageBox.information(self, "ЦВЗ", msg)
             self.actions.btn_save.setEnabled(True)
 
         except Exception as e:
@@ -209,8 +259,6 @@ class ProtectTab(QWidget):
         base_dir = os.path.dirname(self._current_path)
         base_name = os.path.splitext(os.path.basename(self._current_path))[0]
 
-        # По умолчанию предлагаем lossless:
-        # если вход PDF → лучше TIFF, иначе сохраняем в исходном расширении, но фильтр всё равно lossless
         default_ext = ".tiff" if self._document.doc_format == DocumentFormat.PDF else (Path(self._current_path).suffix.lower() or ".png")
         default_name = f"{base_name}_protected{default_ext}"
 
@@ -225,7 +273,6 @@ class ProtectTab(QWidget):
         if not save_path:
             return
 
-        # если пользователь не указал расширение — добавим по выбранному фильтру
         sp = Path(save_path)
         if sp.suffix == "":
             if selected_filter.startswith("TIFF"):
