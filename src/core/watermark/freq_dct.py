@@ -199,3 +199,39 @@ def extract_bytes_dct(image: Image.Image, cfg: DCTConfig, *, max_bytes: int = 20
 
     data = _bits_to_bytes(all_bits)[:total_bytes]
     return _parse_header(data)
+
+def capacity_bits_dct(image: Image.Image, cfg: DCTConfig) -> int:
+    """
+    Сколько "информационных" бит можно записать в DCT при данных cfg,
+    учитывая repetition.
+    """
+    if image.mode != "RGB":
+        image = image.convert("RGB")
+    np_img = np.array(image, dtype=np.uint8)
+
+    ycc = cv2.cvtColor(np_img, cv2.COLOR_RGB2YCrCb)
+    Y = ycc[:, :, 0].astype(np.float32)
+
+    h, w = Y.shape
+    b = cfg.block
+    mask = _get_embed_mask(h, w, cfg.margin_px)
+
+    blocks: List[Tuple[int, int]] = []
+    for y in range(0, h - b + 1, b):
+        for x in range(0, w - b + 1, b):
+            if mask[y:y + b, x:x + b].mean() > 0.7:
+                blocks.append((y, x))
+
+    rep = max(1, int(cfg.repetition))
+    return len(blocks) // rep
+
+
+def capacity_payload_bytes_dct(image: Image.Image, cfg: DCTConfig) -> int:
+    """
+    Сколько байт payload можно спрятать (без учёта нашего chunk-header),
+    учитывая внутренний header DCT (len+crc = 8 байт).
+    """
+    bits = capacity_bits_dct(image, cfg)
+    total_bytes = bits // 8
+    return max(0, total_bytes - 8)  # 8 байт header внутри freq_dct
+

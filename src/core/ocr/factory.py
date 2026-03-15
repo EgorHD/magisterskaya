@@ -6,20 +6,32 @@ from core.ocr.tesseract_engine import TesseractOCREngine, TesseractConfig
 _engine: OCREngine | None = None
 
 
-def get_ocr_engine(*, lang: str = "ru", use_angle_cls: bool = True, use_gpu: bool = False) -> OCREngine:
+def get_ocr_engine(
+    *,
+    lang: str = "ru",
+    use_angle_cls: bool = True,
+    use_gpu: bool = False,
+    table_mode: bool = False,
+) -> OCREngine:
     """
     Сейчас используем стабильный Tesseract.
-    lang игнорируем (в Tesseract задаётся строкой langs).
+    table_mode включает режим для таблиц (PSM=11 + спец.предобработка).
     """
     global _engine
-    if _engine is None:
-        # Если у вас tesseract.exe НЕ в PATH — укажите путь тут:
-        # cfg = TesseractConfig(langs="rus+eng", psm=6, oem=3, tesseract_cmd=r"C:\Program Files\Tesseract-OCR\tesseract.exe")
+
+    # Создаём новый engine при первом вызове.
+    # Если mode меняется на лету — проще создать новый, чтобы конфиг не "залипал".
+    if _engine is None or getattr(_engine, "_table_mode", None) != table_mode:
         cfg = TesseractConfig(
             langs="rus+eng",
-            psm=6,
+            psm=11 if table_mode else 6,
             oem=3,
+            table_mode=table_mode,
             tesseract_cmd=r"C:\Program Files\Tesseract-OCR\tesseract.exe",
         )
-        _engine = TesseractOCREngine(cfg)
+        eng = TesseractOCREngine(cfg)
+        # маленькая пометка для кэша
+        setattr(eng, "_table_mode", table_mode)
+        _engine = eng
+
     return _engine
