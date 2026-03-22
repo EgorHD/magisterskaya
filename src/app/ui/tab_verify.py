@@ -63,7 +63,6 @@ class VerifyTab(QWidget):
         # --- Лёгкий режим ЦВЗ ---
         self.chk_wm_capacity = QCheckBox("Настраиваемый режим ЦВЗ")
         self.chk_wm_capacity.setChecked(True)
-        self.chk_wm_capacity.setEnabled(False)
 
         row = QHBoxLayout()
         row.addWidget(self.chk_wm_capacity)
