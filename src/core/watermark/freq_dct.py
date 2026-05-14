@@ -234,4 +234,3 @@ def capacity_payload_bytes_dct(image: Image.Image, cfg: DCTConfig) -> int:
     bits = capacity_bits_dct(image, cfg)
     total_bytes = bits // 8
     return max(0, total_bytes - 8)  # 8 байт header внутри freq_dct
-

@@ -1,26 +1,27 @@
 from __future__ import annotations
-
 import math
-from typing import Iterable, Optional
+from typing import Iterable, Optional, List, Tuple
 
 from PyQt6.QtCore import Qt, QRectF, QPoint
-from PyQt6.QtGui import QImage, QPixmap
+from PyQt6.QtGui import QImage, QPixmap, QPen, QColor, QPainter
 from PyQt6.QtWidgets import QGraphicsScene, QGraphicsView
 
-from PIL import Image, ImageDraw
-
+from PIL import Image
 from core.models.ocr import OCRPageResult, OCRSpan
 
 
+# Перевод изображения PIL в QPixmap для отображения в Qt
 def pil_to_qpixmap(img: Image.Image) -> QPixmap:
     if img.mode != "RGB":
         img = img.convert("RGB")
+
     w, h = img.size
     data = img.tobytes("raw", "RGB")
     qimg = QImage(data, w, h, 3 * w, QImage.Format.Format_RGB888).copy()
     return QPixmap.fromImage(qimg)
 
 
+# Безопасное извлечение координат bounding box
 def _safe_bbox(span: OCRSpan) -> Optional[tuple[int, int, int, int]]:
     try:
         x1, y1, x2, y2 = span.bbox()
@@ -47,13 +48,6 @@ def _safe_bbox(span: OCRSpan) -> Optional[tuple[int, int, int, int]]:
 
 
 class PagePreview(QGraphicsView):
-    """
-    Просмотр страницы: изображение + рамки, нанесённые на картинку (PIL).
-    Поддержка:
-    - зум колесом
-    - панорамирование ЛКМ (drag-to-pan)
-    - двойной клик = fit to view
-    """
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
 
@@ -64,7 +58,6 @@ class PagePreview(QGraphicsView):
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
 
-        # зум относительно курсора
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
 
@@ -72,17 +65,18 @@ class PagePreview(QGraphicsView):
         self._img_w = 0
         self._img_h = 0
 
-        self.max_boxes = 2000
-        self.box_width = 2
+        # Храним рамки как простые координаты
+        self._boxes: List[Tuple[int, int, int, int]] = []
 
-        # zoom state
+        self.max_boxes = 2000
+        self.box_width = 1
+
         self._zoom = 0
         self._zoom_step = 1.25
         self._zoom_min = -15
         self._zoom_max = 30
         self._auto_fit = True
 
-        # pan state
         self._panning = False
         self._pan_start = QPoint()
 
@@ -91,21 +85,21 @@ class PagePreview(QGraphicsView):
         self._img_item = None
         self._img_w = 0
         self._img_h = 0
+        self._boxes.clear()
         self.resetTransform()
         self._zoom = 0
         self._auto_fit = True
+        self.viewport().update()
 
-    def set_page(self, pil_image: Image.Image, ocr_page: Optional[OCRPageResult] = None) -> None:
+    def set_page(
+        self,
+        pil_image: Image.Image,
+        ocr_page: Optional[OCRPageResult] = None,
+    ) -> None:
         self.clear()
 
         base = pil_image.convert("RGB") if pil_image.mode != "RGB" else pil_image
-
-        if ocr_page is not None and ocr_page.spans:
-            img = base.copy()
-            self._draw_boxes_on_image(img, ocr_page.spans)
-            pix = pil_to_qpixmap(img)
-        else:
-            pix = pil_to_qpixmap(base)
+        pix = pil_to_qpixmap(base)
 
         self._img_w = pix.width()
         self._img_h = pix.height()
@@ -113,12 +107,18 @@ class PagePreview(QGraphicsView):
         self._img_item = self._scene.addPixmap(pix)
         self._scene.setSceneRect(QRectF(0, 0, self._img_w, self._img_h))
 
+        if ocr_page is not None and ocr_page.spans:
+            self._store_boxes(ocr_page.spans)
+
         if self._auto_fit:
             self.fit_to_view()
+
+        self.viewport().update()
 
     def fit_to_view(self) -> None:
         if not self._img_item:
             return
+
         self.resetTransform()
         self._zoom = 0
         self.fitInView(self._scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
@@ -129,6 +129,7 @@ class PagePreview(QGraphicsView):
         self._zoom += 1
         self.scale(self._zoom_step, self._zoom_step)
         self._auto_fit = False
+        self.viewport().update()
 
     def zoom_out(self) -> None:
         if self._zoom <= self._zoom_min:
@@ -136,6 +137,7 @@ class PagePreview(QGraphicsView):
         self._zoom -= 1
         self.scale(1 / self._zoom_step, 1 / self._zoom_step)
         self._auto_fit = False
+        self.viewport().update()
 
     def wheelEvent(self, event) -> None:
         delta = event.angleDelta().y()
@@ -157,8 +159,14 @@ class PagePreview(QGraphicsView):
         if self._panning:
             delta = event.pos() - self._pan_start
             self._pan_start = event.pos()
-            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - delta.x())
-            self.verticalScrollBar().setValue(self.verticalScrollBar().value() - delta.y())
+
+            self.horizontalScrollBar().setValue(
+                self.horizontalScrollBar().value() - delta.x()
+            )
+            self.verticalScrollBar().setValue(
+                self.verticalScrollBar().value() - delta.y()
+            )
+
             event.accept()
             return
         super().mouseMoveEvent(event)
@@ -174,13 +182,13 @@ class PagePreview(QGraphicsView):
     def mouseDoubleClickEvent(self, event) -> None:
         self._auto_fit = True
         self.fit_to_view()
+        self.viewport().update()
         super().mouseDoubleClickEvent(event)
 
-    def _draw_boxes_on_image(self, img: Image.Image, spans: Iterable[OCRSpan]) -> None:
-        draw = ImageDraw.Draw(img)
-        w, h = img.size
-
+    def _store_boxes(self, spans: Iterable[OCRSpan]) -> None:
+        w, h = self._img_w, self._img_h
         count = 0
+
         for sp in spans:
             if count >= self.max_boxes:
                 break
@@ -199,12 +207,36 @@ class PagePreview(QGraphicsView):
             if x2 - x1 <= 1 or y2 - y1 <= 1:
                 continue
 
-            for t in range(self.box_width):
-                draw.rectangle([x1 - t, y1 - t, x2 + t, y2 + t], outline=(255, 0, 0))
-
+            self._boxes.append((x1, y1, x2, y2))
             count += 1
+
+    # Рисуем рамки поверх сцены, без создания отдельных QGraphicsRectItem
+    def drawForeground(self, painter: QPainter, rect: QRectF) -> None:
+        super().drawForeground(painter, rect)
+
+        if not self._boxes:
+            return
+
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+
+        pen = QPen(QColor(255, 0, 0))
+        pen.setWidth(0)          # 1 экранный пиксель
+        pen.setCosmetic(True)    # не зависит от масштаба
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+
+        visible = rect.adjusted(-2, -2, 2, 2)
+
+        for x1, y1, x2, y2 in self._boxes:
+            box = QRectF(float(x1), float(y1), float(x2 - x1), float(y2 - y1))
+            if box.intersects(visible):
+                painter.drawRect(box)
+
+        painter.restore()
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         if self._auto_fit and self._img_item:
             self.fit_to_view()
+        self.viewport().update()

@@ -16,63 +16,73 @@ class DocumentFormat(str, Enum):
 
 @dataclass(slots=True)
 class Page:
-    """
-    Одна страница документа.
-
-    На ранних этапах мы можем хранить:
-    - изображение страницы (когда подключим Pillow/OpenCV) в поле image
-    - либо путь к временному файлу/кэшу (если решим кэшировать рендер)
-    """
+    # Индекс страницы в документе
     index: int
+
+    # Размеры страницы
     width: int | None = None
     height: int | None = None
 
-    # Позже сюда положим PIL.Image или numpy.ndarray.
+    # Изображение страницы
     image: Any | None = None
 
-    # Если страница была получена из временного файла (например, рендер PDF -> PNG)
+    # Путь к временному файлу страницы
     image_path: Optional[Path] = None
 
-    # Текст распознавания (пока строкой; позже будет OCRResult со словами и bbox)
+    # Распознанный текст страницы
     ocr_text: str = ""
-    ocr_result: Any | None = None  # позже: OCRPageResult
+
+    # Результат OCR со спанами и bbox
+    ocr_result: Any | None = None
 
 
 @dataclass(slots=True)
 class Document:
-    """
-    Единая модель "электронного образа документа" для всех форматов.
-    """
+    # Исходный путь к документу
     source_path: Path
+
+    # Формат документа
     doc_format: DocumentFormat = DocumentFormat.UNKNOWN
+
+    # Страницы документа
     pages: list[Page] = field(default_factory=list)
 
-    # Метаданные (пригодится для PDF: dpi, размер страницы и т.п.)
+    # Служебные метаданные
     meta: dict[str, Any] = field(default_factory=dict)
 
+    # Количество страниц
     def page_count(self) -> int:
         return len(self.pages)
 
+    # Проверка на многостраничный документ
     def is_multipage(self) -> bool:
         return len(self.pages) > 1
 
+    # Имя файла документа
     @property
     def name(self) -> str:
         return self.source_path.name
 
+    # Расширение файла без точки
     @property
     def suffix(self) -> str:
         return self.source_path.suffix.lower().lstrip(".")
 
+    # Определение формата по расширению
     @staticmethod
     def detect_format(path: Path) -> DocumentFormat:
         ext = path.suffix.lower().lstrip(".")
+
         if ext == "pdf":
             return DocumentFormat.PDF
+
         if ext in ("tif", "tiff"):
             return DocumentFormat.TIFF
+
         if ext in ("jpg", "jpeg"):
             return DocumentFormat.JPEG
+
         if ext == "png":
             return DocumentFormat.PNG
+
         return DocumentFormat.UNKNOWN

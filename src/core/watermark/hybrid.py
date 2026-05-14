@@ -2,58 +2,48 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from typing import List, Tuple, Optional
+from typing import List, Optional, Tuple
 
 from core.models.document import Document
 from core.watermark.codec import compress_text, decompress_text, sha256_trunc
-
+from core.watermark.freq_dct import (
+    DCTConfig,
+    capacity_payload_bytes_dct,
+    embed_bytes_dct,
+    extract_bytes_dct,
+)
 from core.watermark.spatial_word_lsb import (
     SpatialWordLSBConfig,
     embed_hashes_in_words,
     extract_hashes_from_words,
 )
 
-from core.watermark.freq_dct import (
-    DCTConfig,
-    embed_bytes_dct,
-    extract_bytes_dct,
-    capacity_payload_bytes_dct,
-)
-
-# ----------------------------
-# Config
-# ----------------------------
 
 @dataclass(slots=True)
 class HybridConfig:
-    """
-    Гибридный ЦВЗ:
-    - spatial: LSB в bbox слов (хрупкий слой для локализации подмены)
-    - freq: DCT (резервный слой для восстановления текста)
-    """
+    # Пространственный слой
     spatial: SpatialWordLSBConfig = field(default_factory=SpatialWordLSBConfig)
+
+    # Частотный слой
     freq: DCTConfig = field(default_factory=DCTConfig)
 
-    # сколько байт хеша на слово/спан
+    # Число байт хеша на слово
     word_hash_bytes: int = 4
 
-    # лимит резервного текста (после zlib)
+    # Максимальный размер резервного текста после сжатия
     max_redundant_bytes: int = 120_000
 
-    # режим: стандартный / лёгкий (ёмкостный)
+    # Режим повышенной ёмкости
     capacity_mode: bool = False
 
-    # параметры лёгкого режима (можно подкрутить)
+    # Параметры лёгкого режима
     light_repetition: int = 1
-    light_margin_px: int = 0   # 0 = вся страница
-    light_delta: float = 18.0  # усиление для устойчивого извлечения (CRC)
+    light_margin_px: int = 0
+    light_delta: float = 18.0
 
 
+# Эффективная конфигурация DCT с учётом лёгкого режима
 def _effective_freq_cfg(cfg: HybridConfig) -> DCTConfig:
-    """
-    Возвращает DCTConfig с учётом лёгкого режима.
-    ВАЖНО: не мутирует cfg.freq.
-    """
     if cfg.capacity_mode:
         return replace(
             cfg.freq,
@@ -64,46 +54,45 @@ def _effective_freq_cfg(cfg: HybridConfig) -> DCTConfig:
     return cfg.freq
 
 
-# ----------------------------
-# Results
-# ----------------------------
-
 @dataclass(slots=True)
 class HybridExtractResult:
-    """
-    Совместимость со старым интерфейсом:
-    primary — не используем (оставляем пустым),
-    redundant — байты резервного текста (из частотного слоя)
-    """
+    # Успешность извлечения
     ok: bool
+
+    # Primary-слой
     primary: bytes
+
+    # Redundant-слой
     redundant: bytes
+
+    # Текст ошибки
     error: Optional[str] = None
 
 
 @dataclass(slots=True)
 class HybridVerifyPage:
+    # Статус проверки страницы
     ok: bool
+
+    # Индексы изменённых слов
     changed_indices: List[int]
+
+    # Текст ошибки
     error: Optional[str] = None
 
 
-# ----------------------------
-# Helpers: spans ordering
-# ----------------------------
-
+# Сортировка OCR-спанов по порядку чтения
 def _sorted_spans(page) -> list:
     spans = list(page.ocr_result.spans)
     spans.sort(key=lambda sp: (sp.bbox()[1], sp.bbox()[0]))
     return spans
 
 
-# ----------------------------
-# Chunked redundant for capacity-mode
-# ----------------------------
+# Сигнатура chunked payload
+_MAGIC = b"CHNK"
 
-_MAGIC = b"CHNK"  # 4 bytes
 
+# Упаковка одного чанка
 def _pack_chunk(
     total_parts: int,
     part_index: int,
@@ -111,7 +100,6 @@ def _pack_chunk(
     full_sha8: bytes,
     chunk: bytes,
 ) -> bytes:
-    # формат: MAGIC(4) + total(2) + idx(2) + full_len(4) + sha8(8) + chunk
     return (
         _MAGIC
         + int(total_parts).to_bytes(2, "big")
@@ -121,82 +109,79 @@ def _pack_chunk(
         + chunk
     )
 
+
+# Попытка распаковать chunked payload
 def _try_unpack_chunk(payload: bytes):
     if not payload or len(payload) < 4 + 2 + 2 + 4 + 8:
         return None
+
     if payload[:4] != _MAGIC:
         return None
+
     total = int.from_bytes(payload[4:6], "big")
     idx = int.from_bytes(payload[6:8], "big")
     full_len = int.from_bytes(payload[8:12], "big")
     sha8 = payload[12:20]
     chunk = payload[20:]
+
     return total, idx, full_len, sha8, chunk
 
 
-# ----------------------------
-# Core: embed
-# ----------------------------
-
+# Встраивание гибридного ЦВЗ в документ
 def embed_document(doc: Document, cfg: HybridConfig) -> Document:
-    """
-    Гибридный ЦВЗ:
-    1) spatial: LSB в bbox слов (локализация подмены)
-    2) freq: DCT (резервный текст для восстановления)
-
-    capacity_mode:
-      - repetition=1 (или cfg.light_repetition)
-      - margin_px=0 (вся страница) или cfg.light_margin_px
-      - redundant дробится по страницам чанками
-    """
-    # 0) общий текст (по ocr_text страниц)
+    # Общий OCR-текст документа
     full_text = "\n".join((p.ocr_text or "") for p in doc.pages).strip()
+
+    # Сжатый резервный текст
     redundant = compress_text(full_text)
     if len(redundant) > cfg.max_redundant_bytes:
         redundant = redundant[: cfg.max_redundant_bytes]
 
-    # 1) spatial слой — в каждую страницу
+    # Spatial-слой: хеши слов в каждую страницу
     for page in doc.pages:
         if page.image is None or page.ocr_result is None:
             continue
+
         spans = _sorted_spans(page)
         hashes = [sha256_trunc(sp.text, nbytes=cfg.word_hash_bytes) for sp in spans]
         page.image = embed_hashes_in_words(page.image, spans, hashes, cfg.spatial)
 
-    # 2) freq слой
+    # Обычный режим: один и тот же redundant на каждую страницу
     if not cfg.capacity_mode:
-        # стандартный режим: одинаковый резервный текст в каждую страницу
         for page in doc.pages:
             if page.image is None or page.ocr_result is None:
                 continue
             page.image = embed_bytes_dct(page.image, redundant, cfg.freq)
+
         return doc
 
-    # лёгкий режим: повышаем ёмкость + дробим по страницам
+    # Лёгкий режим: дробление redundant по страницам
     freq_cfg = _effective_freq_cfg(cfg)
-    full_sha8 = sha256_trunc(full_text, nbytes=8)  # идентификатор набора чанков
+    full_sha8 = sha256_trunc(full_text, nbytes=8)
     full_len = len(redundant)
 
-    # считаем ёмкости по страницам
-    page_caps: List[Tuple[int, int]] = []  # (page_index, cap_bytes)
+    # Ёмкости страниц
+    page_caps: List[Tuple[int, int]] = []
     for i, page in enumerate(doc.pages):
         if page.image is None:
             continue
+
         cap = capacity_payload_bytes_dct(page.image, freq_cfg)
         page_caps.append((i, cap))
 
     if not page_caps:
         raise ValueError("Нет страниц с изображением для DCT-слоя")
 
-    # сортируем по убыванию ёмкости
+    # Страницы с наибольшей ёмкостью первыми
     page_caps.sort(key=lambda t: t[1], reverse=True)
 
-    # overhead нашего chunk-header: 4+2+2+4+8 = 20 байт
+    # Размер заголовка chunk
     CH_OVERHEAD = 20
 
-    # эффективная ёмкость (за вычетом header)
+    # Эффективные ёмкости
     effective_caps: List[Tuple[int, int]] = []
     total_capacity = 0
+
     for pi, cap in page_caps:
         eff = max(0, cap - CH_OVERHEAD)
         if eff > 0:
@@ -209,65 +194,67 @@ def embed_document(doc: Document, cfg: HybridConfig) -> Document:
             f"нужно {len(redundant)}B, есть {total_capacity}B"
         )
 
-    # режем на чанки по страницам
+    # Разбиение redundant на чанки
     chunks: List[Tuple[int, bytes]] = []
     pos = 0
+
     for pi, eff in effective_caps:
         if pos >= len(redundant):
             break
+
         chunk = redundant[pos:pos + eff]
         chunks.append((pi, chunk))
         pos += len(chunk)
 
     total_parts = len(chunks)
 
-    # записываем каждый чанк на выбранную страницу
+    # Запись чанков по страницам
     for part_idx, (pi, chunk) in enumerate(chunks):
         page = doc.pages[pi]
         if page.image is None:
             continue
+
         payload = _pack_chunk(total_parts, part_idx, full_len, full_sha8, chunk)
         page.image = embed_bytes_dct(page.image, payload, freq_cfg)
 
     return doc
 
 
-# ----------------------------
-# Core: verify (spatial)
-# ----------------------------
-
+# Проверка страницы по spatial-слою
 def verify_page(doc: Document, page_index: int, cfg: HybridConfig) -> HybridVerifyPage:
-    """
-    Проверка целостности по spatial-слою (bbox слов).
-    Возвращает индексы span'ов (в отсортированном порядке), где хеш не совпал.
-    """
     page = doc.pages[page_index]
+
     if page.image is None or page.ocr_result is None:
         return HybridVerifyPage(False, [], "No image or OCR")
 
     spans = _sorted_spans(page)
-    extracted = extract_hashes_from_words(page.image, spans, cfg.word_hash_bytes, cfg.spatial)
+    extracted = extract_hashes_from_words(
+        page.image,
+        spans,
+        cfg.word_hash_bytes,
+        cfg.spatial,
+    )
 
     changed: List[int] = []
+
     for i, sp in enumerate(spans):
         exp = sha256_trunc(sp.text, nbytes=cfg.word_hash_bytes)
         got = extracted[i] if i < len(extracted) else b""
+
         if (not got) or (got != exp):
             changed.append(i)
 
-    return HybridVerifyPage(ok=(len(changed) == 0), changed_indices=changed, error=None)
+    return HybridVerifyPage(
+        ok=(len(changed) == 0),
+        changed_indices=changed,
+        error=None,
+    )
 
 
-# ----------------------------
-# Core: extract DCT payload
-# ----------------------------
-
+# Извлечение DCT-слоя с одной страницы
 def extract_from_page(doc: Document, page_index: int, cfg: HybridConfig) -> HybridExtractResult:
-    """
-    СОВМЕСТИМОСТЬ ДЛЯ UI:
-    Извлекаем резервный слой (частотный DCT) с конкретной страницы.
-    """
     page = doc.pages[page_index]
+
     if page.image is None:
         return HybridExtractResult(False, b"", b"", "No image")
 
@@ -276,32 +263,33 @@ def extract_from_page(doc: Document, page_index: int, cfg: HybridConfig) -> Hybr
         redundant = extract_bytes_dct(page.image, freq_cfg)
         return HybridExtractResult(True, b"", redundant, None)
     except Exception as e:
-        return HybridExtractResult(False, b"", b"", f"Extract error: {type(e).__name__}: {e}")
+        return HybridExtractResult(
+            False,
+            b"",
+            b"",
+            f"Extract error: {type(e).__name__}: {e}",
+        )
 
 
+# Обычное извлечение redundant с любой страницы
 def extract_redundant_text_from_any_page(doc: Document, cfg: HybridConfig) -> str:
-    """
-    Старый простой способ: резервный текст читаем с любой страницы и decompress.
-    (Работает для стандартного режима и для лёгкого режима ТОЛЬКО если payload не chunked.)
-    """
     for i in range(len(doc.pages)):
         ext = extract_from_page(doc, i, cfg)
         if not ext.ok or not ext.redundant:
             continue
+
         try:
             return decompress_text(ext.redundant)
         except Exception:
             continue
+
     return ""
 
 
+# Сборка chunked redundant со всех страниц
 def extract_chunked_redundant_text(doc: Document, cfg: HybridConfig) -> Tuple[str, str]:
-    """
-    Для лёгкого режима (chunked): пытаемся собрать чанки со всех страниц.
-    Возвращает (text, debug).
-    """
     parts_by_key: dict[bytes, dict[int, bytes]] = {}
-    meta_by_key: dict[bytes, Tuple[int, int]] = {}  # sha8 -> (total_parts, full_len)
+    meta_by_key: dict[bytes, Tuple[int, int]] = {}
 
     for i in range(len(doc.pages)):
         ext = extract_from_page(doc, i, cfg)
@@ -313,6 +301,7 @@ def extract_chunked_redundant_text(doc: Document, cfg: HybridConfig) -> Tuple[st
             continue
 
         total, idx, full_len, sha8, chunk = parsed
+
         if total <= 0 or idx < 0 or idx >= total:
             continue
 
@@ -329,11 +318,13 @@ def extract_chunked_redundant_text(doc: Document, cfg: HybridConfig) -> Tuple[st
         total, full_len = meta_by_key.get(sha8, (0, 0))
         if total <= 0:
             continue
+
         if len(parts) != total:
             return "", f"FAIL: chunks incomplete (have {len(parts)}/{total})"
 
         blob = b"".join(parts[k] for k in range(total))
         blob = blob[:full_len]
+
         try:
             text = decompress_text(blob)
             return text, f"OK: restored chunked redundant (parts={total}, bytes={len(blob)})"
@@ -343,18 +334,14 @@ def extract_chunked_redundant_text(doc: Document, cfg: HybridConfig) -> Tuple[st
     return "", "FAIL: chunked payloads exist, but none assembled"
 
 
+# Универсальное извлечение redundant-текста
 def extract_redundant_text(doc: Document, cfg: HybridConfig) -> Tuple[str, str]:
-    """
-    Универсальный метод:
-    - если payload chunked -> собираем чанки
-    - иначе -> fallback на старый способ
-    """
-    # 1) пробуем chunked
+    # Сначала пробуем chunked-режим
     text, dbg = extract_chunked_redundant_text(doc, cfg)
     if text:
         return text, dbg
 
-    # 2) fallback обычный
+    # Потом обычное извлечение с любой страницы
     text2 = extract_redundant_text_from_any_page(doc, cfg)
     if text2:
         return text2, "OK: extracted non-chunk redundant from any page"

@@ -1,6 +1,8 @@
+# Общая ошибка OCR-движка
 class OCREngineError(Exception):
-    """Общая ошибка OCR-движка."""
+    pass
 
 
+# OCR-движок недоступен
 class OCREngineNotAvailable(OCREngineError):
-    """OCR-движок недоступен (нет зависимостей/моделей и т.п.)."""
+    pass
